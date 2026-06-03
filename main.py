@@ -25,7 +25,18 @@ class DrawPlugin(Star):
     # ---------- 配置读取 ----------
     @property
     def base_url(self) -> str:
-        return (self.config.get("base_url", "") or "").strip().rstrip("/")
+        u = (self.config.get("base_url", "") or "").strip().rstrip("/")
+        # 容错：用户可能把完整路径也填进来了，砍掉末尾的已知接口路径
+        for suffix in (
+            "/chat/completions",
+            "/images/generations",
+            "/images/edits",
+            "/images",
+        ):
+            if u.endswith(suffix):
+                u = u[: -len(suffix)]
+                break
+        return u.rstrip("/")
 
     @property
     def api_key(self) -> str:
@@ -110,6 +121,44 @@ class DrawPlugin(Star):
         else:
             yield event.plain_result(text or "❌ 接口未返回图片。")
 
+    # ---------- 统一请求：失败时带上状态码和原始返回 ----------
+    async def _post_json(self, session, url, *, json=None, data=None, headers=None):
+        async with session.post(url, json=json, data=data, headers=headers) as resp:
+            raw = await resp.text()
+            try:
+                import json as _json
+                return _json.loads(raw)
+            except Exception:
+                snippet = raw.strip().replace("\n", " ")[:200]
+                if not snippet:
+                    snippet = "(空响应)"
+                raise RuntimeError(
+                    f"接口未返回 JSON [HTTP {resp.status}] @ {url}\n"
+                    f"原始返回：{snippet}\n"
+                    f"→ 多半是 base_url 路径不对、模型名错、或该接口走错了 mode。"
+                )
+
+    @filter.command("画图配置")
+    async def draw_debug(self, event: AstrMessageEvent):
+        """查看当前画图配置与实际请求地址"""
+        if self.admin_only and not event.is_admin():
+            yield event.plain_result("⚠️ 仅管理员可用。")
+            return
+        if self.mode == "chat":
+            real = f"{self.base_url}/chat/completions"
+        else:
+            real = f"{self.base_url}/images/generations (文生图) | {self.base_url}/images/edits (图生图)"
+        masked = (self.api_key[:4] + "***" + self.api_key[-4:]) if len(self.api_key) > 8 else "(未填或过短)"
+        yield event.plain_result(
+            "🛠 当前画图配置\n"
+            f"mode   : {self.mode}\n"
+            f"base_url: {self.base_url or '(未填)'}\n"
+            f"model  : {self.model or '(未填)'}\n"
+            f"api_key: {masked}\n"
+            f"size   : {self.size}\n"
+            f"实际请求: {real}"
+        )
+
     # ---------- 收集图片 ----------
     async def _collect_images(self, event: AstrMessageEvent) -> list[bytes]:
         images: list[bytes] = []
@@ -166,16 +215,14 @@ class DrawPlugin(Star):
                         content_type="image/png",
                     )
                 headers = {"Authorization": f"Bearer {self.api_key}"}
-                async with session.post(url, data=form, headers=headers) as resp:
-                    payload = await resp.json(content_type=None)
+                payload = await self._post_json(session, url, data=form, headers=headers)
             else:
                 # 文生图：/v1/images/generations
                 url = f"{self.base_url}/images/generations"
                 body = {"model": self.model, "prompt": prompt, "n": 1}
                 if self.size:
                     body["size"] = self.size
-                async with session.post(url, json=body, headers=self.headers) as resp:
-                    payload = await resp.json(content_type=None)
+                payload = await self._post_json(session, url, json=body, headers=self.headers)
 
         return await self._parse_images_payload(payload)
 
@@ -214,8 +261,7 @@ class DrawPlugin(Star):
         }
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=body, headers=self.headers) as resp:
-                payload = await resp.json(content_type=None)
+            payload = await self._post_json(session, url, json=body, headers=self.headers)
         return await self._parse_chat_payload(payload)
 
     async def _parse_chat_payload(self, payload: dict):
