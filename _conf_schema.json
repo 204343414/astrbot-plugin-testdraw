@@ -1,0 +1,44 @@
+{
+  "base_url": {
+    "description": "接口地址 URL（OpenAI 格式）。例: https://api.openai.com/v1 （只填到 /v1，路径会自动拼接）",
+    "type": "string",
+    "default": "https://api.openai.com/v1",
+    "hint": "只填到 /v1 即可，generations/chat 路径自动补全"
+  },
+  "api_key": {
+    "description": "API Key",
+    "type": "string",
+    "default": ""
+  },
+  "model": {
+    "description": "模型名。例: gpt-image-1 / dall-e-3（images模式）或 gpt-4o-image / gemini-2.5-flash-image（chat模式）",
+    "type": "string",
+    "default": "gpt-image-1"
+  },
+  "mode": {
+    "description": "接口模式：images=/v1/images 标准接口(DALL·E风格)；chat=/v1/chat/completions 多模态中转(返回图的中转模型)",
+    "type": "string",
+    "default": "images",
+    "options": ["images", "chat"]
+  },
+  "size": {
+    "description": "图片尺寸（仅 images 模式生效），如 1024x1024、auto",
+    "type": "string",
+    "default": "1024x1024"
+  },
+  "admin_only": {
+    "description": "是否仅管理员可用。开启=只有管理员能 /画图；关闭=所有人可用",
+    "type": "bool",
+    "default": true
+  },
+  "timeout": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "extra_prompt": {
+    "description": "追加到每次提示词后的内容（可留空）",
+    "type": "string",
+    "default": ""
+  }
+}
