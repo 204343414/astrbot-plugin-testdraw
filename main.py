@@ -200,22 +200,7 @@ class DrawPlugin(Star):
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             if input_images:
-                # 图生图：/v1/images/edits，multipart
-                url = f"{self.base_url}/images/edits"
-                form = aiohttp.FormData()
-                form.add_field("model", self.model)
-                form.add_field("prompt", prompt or "edit this image")
-                if self.size:
-                    form.add_field("size", self.size)
-                for i, img in enumerate(input_images):
-                    form.add_field(
-                        "image[]" if len(input_images) > 1 else "image",
-                        img,
-                        filename=f"image_{i}.png",
-                        content_type="image/png",
-                    )
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                payload = await self._post_json(session, url, data=form, headers=headers)
+                payload = await self._images_edit(session, prompt, input_images)
             else:
                 # 文生图：/v1/images/generations
                 url = f"{self.base_url}/images/generations"
@@ -225,6 +210,52 @@ class DrawPlugin(Star):
                 payload = await self._post_json(session, url, json=body, headers=self.headers)
 
         return await self._parse_images_payload(payload)
+
+    async def _images_edit(self, session, prompt: str, input_images: list[bytes]):
+        """图生图 /v1/images/edits。
+        xAI / grok 要求 application/json（image 为 data URI），而标准 OpenAI
+        要求 multipart/form-data。这里优先 JSON，失败再回退 multipart。
+        """
+        url = f"{self.base_url}/images/edits"
+        data_uris = [
+            f"data:image/png;base64,{base64.b64encode(img).decode()}"
+            for img in input_images
+        ]
+
+        # —— 方式 1：JSON（xAI/grok 风格）——
+        if len(data_uris) == 1:
+            json_body = {
+                "model": self.model,
+                "prompt": prompt or "edit this image",
+                "image": {"type": "image_url", "url": data_uris[0]},
+            }
+        else:
+            json_body = {
+                "model": self.model,
+                "prompt": prompt or "edit this image",
+                "images": [{"type": "image_url", "url": u} for u in data_uris],
+            }
+        try:
+            return await self._post_json(session, url, json=json_body, headers=self.headers)
+        except Exception as e_json:
+            logger.warning(f"[draw] edits JSON 方式失败，回退 multipart：{e_json}")
+
+        # —— 方式 2：multipart（标准 OpenAI 风格）——
+        form = aiohttp.FormData()
+        form.add_field("model", self.model)
+        form.add_field("prompt", prompt or "edit this image")
+        if self.size:
+            form.add_field("size", self.size)
+        for i, img in enumerate(input_images):
+            form.add_field(
+                "image[]" if len(input_images) > 1 else "image",
+                img,
+                filename=f"image_{i}.png",
+                content_type="image/png",
+            )
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        return await self._post_json(session, url, data=form, headers=headers)
+
 
     async def _parse_images_payload(self, payload: dict):
         if not isinstance(payload, dict):
