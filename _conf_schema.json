@@ -11,9 +11,19 @@
     "default": ""
   },
   "model": {
-    "description": "模型名。例: gpt-image-1 / dall-e-3（images模式）或 gpt-4o-image / gemini-2.5-flash-image（chat模式）",
+    "description": "文生图模型名。例: gpt-image-1 / dall-e-3 / grok-imagine-image-quality（images模式）或 gpt-4o-image（chat模式）",
     "type": "string",
     "default": "gpt-image-1"
+  },
+  "edit_model": {
+    "description": "图生图专用模型名（留空则与 model 相同）。注意：grok 系图生图需用 grok-imagine-image-edit，而非文生图的 quality 模型",
+    "type": "string",
+    "default": ""
+  },
+  "edit_use_multipart": {
+    "description": "图生图优先用 multipart/form-data（grok2api 类中转需要 true；xAI 官方/标准则可设 false 走 JSON）",
+    "type": "bool",
+    "default": true
   },
   "mode": {
     "description": "接口模式：images=/v1/images 标准接口(DALL·E风格)；chat=/v1/chat/completions 多模态中转(返回图的中转模型)",

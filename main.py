@@ -10,6 +10,10 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
+class _BizError(Exception):
+    """明确的业务错误（非 image 字段格式问题），不再尝试其它格式。"""
+
+
 @register(
     "astrbot_plugin_draw",
     "you",
@@ -49,6 +53,15 @@ class DrawPlugin(Star):
     @property
     def mode(self) -> str:
         return (self.config.get("mode", "images") or "images").strip().lower()
+
+    @property
+    def edit_model(self) -> str:
+        # 图生图专用模型，留空则用 model
+        return (self.config.get("edit_model", "") or "").strip() or self.model
+
+    @property
+    def edit_use_multipart(self) -> bool:
+        return bool(self.config.get("edit_use_multipart", True))
 
     @property
     def size(self) -> str:
@@ -151,12 +164,14 @@ class DrawPlugin(Star):
         masked = (self.api_key[:4] + "***" + self.api_key[-4:]) if len(self.api_key) > 8 else "(未填或过短)"
         yield event.plain_result(
             "🛠 当前画图配置\n"
-            f"mode   : {self.mode}\n"
-            f"base_url: {self.base_url or '(未填)'}\n"
-            f"model  : {self.model or '(未填)'}\n"
-            f"api_key: {masked}\n"
-            f"size   : {self.size}\n"
-            f"实际请求: {real}"
+            f"mode      : {self.mode}\n"
+            f"base_url  : {self.base_url or '(未填)'}\n"
+            f"model(文生图): {self.model or '(未填)'}\n"
+            f"edit_model(图生图): {self.edit_model or '(未填)'}\n"
+            f"edit_multipart优先: {self.edit_use_multipart}\n"
+            f"api_key   : {masked}\n"
+            f"size      : {self.size}\n"
+            f"实际请求  : {real}"
         )
 
     # ---------- 收集图片 ----------
@@ -212,81 +227,107 @@ class DrawPlugin(Star):
         return await self._parse_images_payload(payload)
 
     async def _images_edit(self, session, prompt: str, input_images: list[bytes]):
-        """图生图 /v1/images/edits。
-        不同服务对 edits 的 image 字段格式要求不一：
-          - xAI/grok 官方：JSON，image={"type":"image_url","url":data_uri}
-          - 部分中转：JSON，image=data_uri（扁平字符串）
-          - 标准 OpenAI：multipart/form-data
-        这里依次尝试，直到拿到 JSON 响应为止。
+        """图生图 /v1/images/edits。会依次尝试多种请求格式：
+          - multipart/form-data，image[] 文件（grok2api 类中转 / 标准 OpenAI）
+          - JSON image={"type":"image_url","url":data_uri}（xAI 官方）
+          - JSON image=data_uri（扁平字符串中转）
+          - JSON images=[{type,url}] / image_url=data_uri
+        模型用 edit_model（grok 图生图须为 grok-imagine-image-edit）。
+        每种失败都记录真实错误，全失败时汇总报出。
         """
+        errors = []  # [(label, msg)]
+        order = (["multipart"] + ["json"]) if self.edit_use_multipart else (["json"] + ["multipart"])
+
+        for kind in order:
+            try:
+                if kind == "multipart":
+                    payload = await self._edit_multipart(session, prompt, input_images, errors)
+                else:
+                    payload = await self._edit_json(session, prompt, input_images, errors)
+                if payload is not None:
+                    return payload
+            except _BizError as e:
+                # 明确的业务错误（非 image 字段问题），直接抛
+                raise RuntimeError(str(e))
+
+        detail = "；".join(f"[{lbl}] {msg}" for lbl, msg in errors) or "(无详细信息)"
+        raise RuntimeError(
+            "图生图所有请求格式均失败。请检查：① 图生图模型是否填对"
+            "（grok 系须用 grok-imagine-image-edit，在配置 edit_model 里填）；"
+            "② 该中转是否支持 /images/edits。\n"
+            f"各格式返回：{detail}"
+        )
+
+    async def _edit_multipart(self, session, prompt, input_images, errors):
         url = f"{self.base_url}/images/edits"
+        p = prompt or "edit this image"
+        single = len(input_images) == 1
+        form = aiohttp.FormData()
+        form.add_field("model", self.edit_model)
+        form.add_field("prompt", p)
+        form.add_field("n", "1")
+        if self.size:
+            form.add_field("size", self.size)
+        for i, img in enumerate(input_images):
+            form.add_field(
+                "image[]" if not single else "image",
+                img,
+                filename=f"image_{i}.png",
+                content_type="image/png",
+            )
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            payload = await self._post_json(session, url, data=form, headers=headers)
+        except Exception as e:
+            errors.append(("multipart", str(e).split("\n")[0]))
+            return None
+        return self._check_edit_payload(payload, "multipart", errors)
+
+    async def _edit_json(self, session, prompt, input_images, errors):
+        url = f"{self.base_url}/images/edits"
+        p = prompt or "edit this image"
+        m = self.edit_model
         data_uris = [
             f"data:image/png;base64,{base64.b64encode(img).decode()}"
             for img in input_images
         ]
-        p = prompt or "edit this image"
-
-        # 候选 JSON body 列表（按可能性排序）
-        candidates = []
-        if len(data_uris) == 1:
-            # 1) xAI 官方对象格式
-            candidates.append({
-                "model": self.model, "prompt": p,
-                "image": {"type": "image_url", "url": data_uris[0]},
-            })
-            # 2) 扁平字符串格式
-            candidates.append({
-                "model": self.model, "prompt": p,
-                "image": data_uris[0],
-            })
-            # 3) 数组对象格式
-            candidates.append({
-                "model": self.model, "prompt": p,
-                "images": [{"type": "image_url", "url": data_uris[0]}],
-            })
+        single = len(data_uris) == 1
+        if single:
+            u0 = data_uris[0]
+            candidates = [
+                ("json-object", {"model": m, "prompt": p, "image": {"type": "image_url", "url": u0}}),
+                ("json-flatstr", {"model": m, "prompt": p, "image": u0}),
+                ("json-imgarr", {"model": m, "prompt": p, "images": [{"type": "image_url", "url": u0}]}),
+                ("json-image_url", {"model": m, "prompt": p, "image_url": u0}),
+            ]
         else:
-            candidates.append({
-                "model": self.model, "prompt": p,
-                "images": [{"type": "image_url", "url": u} for u in data_uris],
-            })
-            candidates.append({
-                "model": self.model, "prompt": p,
-                "image": [{"type": "image_url", "url": u} for u in data_uris],
-            })
-
-        last_err = None
-        for body in candidates:
+            arr = [{"type": "image_url", "url": u} for u in data_uris]
+            candidates = [
+                ("json-imgarr", {"model": m, "prompt": p, "images": arr}),
+                ("json-imagearr", {"model": m, "prompt": p, "image": arr}),
+            ]
+        for label, body in candidates:
             try:
                 payload = await self._post_json(session, url, json=body, headers=self.headers)
             except Exception as e:
-                # 非 JSON 响应（可能要 multipart）—— 停止 JSON 尝试，去回退
-                last_err = e
-                break
-            # 拿到 JSON 了。如果是 image 字段相关的报错，换下一种格式重试
-            err_msg = self._extract_error_msg(payload)
-            if err_msg and ("image" in err_msg.lower() and "required" in err_msg.lower()):
-                last_err = RuntimeError(err_msg)
+                errors.append((label, str(e).split("\n")[0]))
                 continue
-            return payload  # 成功，或其它业务错误（交给 parse 报具体错）
+            result = self._check_edit_payload(payload, label, errors)
+            if result is not None:
+                return result
+        return None
 
-        # —— 回退：multipart（标准 OpenAI 风格）——
-        try:
-            form = aiohttp.FormData()
-            form.add_field("model", self.model)
-            form.add_field("prompt", p)
-            if self.size:
-                form.add_field("size", self.size)
-            for i, img in enumerate(input_images):
-                form.add_field(
-                    "image[]" if len(input_images) > 1 else "image",
-                    img,
-                    filename=f"image_{i}.png",
-                    content_type="image/png",
-                )
-            headers = {"Authorization": f"Bearer {self.api_key}"}
-            return await self._post_json(session, url, data=form, headers=headers)
-        except Exception as e:
-            raise last_err or e
+    def _check_edit_payload(self, payload, label, errors):
+        """返回成功 payload；image 字段类错误返回 None（继续尝试）；
+        其它业务错误抛 _BizError（直接终止）。"""
+        err_msg = self._extract_error_msg(payload)
+        if not err_msg:
+            return payload
+        errors.append((label, err_msg))
+        low = err_msg.lower()
+        if "image" in low and any(k in low for k in ("required", "invalid", "missing", "multipart", "form")):
+            return None
+        raise _BizError(err_msg)
 
     def _extract_error_msg(self, payload):
         if isinstance(payload, dict) and payload.get("error"):
