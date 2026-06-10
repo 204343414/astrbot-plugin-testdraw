@@ -32,7 +32,9 @@ json 里填 url / api / 模型名就能画。
 ## 两种模式
 
 - **images**：标准 `/v1/images/generations`（文生图）和 `/v1/images/edits`（图生图）。
-  适用 DALL·E 风格、`gpt-image-1` 等。返回 `url` 或 `b64_json` 都能处理。
+  适用 DALL·E 风格、`gpt-image-1`、grok-imagine 等。返回 `url` 或 `b64_json` 都能处理。
+  图生图自动兼容多种格式：xAI/grok 的 JSON（`image` 对象/扁平字符串）与标准 OpenAI 的 multipart，
+  命中 `image is required` 会自动换格式重试，无需手动配置。
 - **chat**：`/v1/chat/completions` 多模态。图片+提示词丢进 chat，模型把图返回。
   适用各类把绘图能力包成 chat 的中转模型（如 `gpt-4o-image`、`gemini-2.5-flash-image` / nano-banana 等）。
   返回的图支持：`message.images` 字段、content 里的 markdown 图、data-uri、直链。

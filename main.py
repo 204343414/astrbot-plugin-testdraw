@@ -213,48 +213,86 @@ class DrawPlugin(Star):
 
     async def _images_edit(self, session, prompt: str, input_images: list[bytes]):
         """图生图 /v1/images/edits。
-        xAI / grok 要求 application/json（image 为 data URI），而标准 OpenAI
-        要求 multipart/form-data。这里优先 JSON，失败再回退 multipart。
+        不同服务对 edits 的 image 字段格式要求不一：
+          - xAI/grok 官方：JSON，image={"type":"image_url","url":data_uri}
+          - 部分中转：JSON，image=data_uri（扁平字符串）
+          - 标准 OpenAI：multipart/form-data
+        这里依次尝试，直到拿到 JSON 响应为止。
         """
         url = f"{self.base_url}/images/edits"
         data_uris = [
             f"data:image/png;base64,{base64.b64encode(img).decode()}"
             for img in input_images
         ]
+        p = prompt or "edit this image"
 
-        # —— 方式 1：JSON（xAI/grok 风格）——
+        # 候选 JSON body 列表（按可能性排序）
+        candidates = []
         if len(data_uris) == 1:
-            json_body = {
-                "model": self.model,
-                "prompt": prompt or "edit this image",
+            # 1) xAI 官方对象格式
+            candidates.append({
+                "model": self.model, "prompt": p,
                 "image": {"type": "image_url", "url": data_uris[0]},
-            }
+            })
+            # 2) 扁平字符串格式
+            candidates.append({
+                "model": self.model, "prompt": p,
+                "image": data_uris[0],
+            })
+            # 3) 数组对象格式
+            candidates.append({
+                "model": self.model, "prompt": p,
+                "images": [{"type": "image_url", "url": data_uris[0]}],
+            })
         else:
-            json_body = {
-                "model": self.model,
-                "prompt": prompt or "edit this image",
+            candidates.append({
+                "model": self.model, "prompt": p,
                 "images": [{"type": "image_url", "url": u} for u in data_uris],
-            }
-        try:
-            return await self._post_json(session, url, json=json_body, headers=self.headers)
-        except Exception as e_json:
-            logger.warning(f"[draw] edits JSON 方式失败，回退 multipart：{e_json}")
+            })
+            candidates.append({
+                "model": self.model, "prompt": p,
+                "image": [{"type": "image_url", "url": u} for u in data_uris],
+            })
 
-        # —— 方式 2：multipart（标准 OpenAI 风格）——
-        form = aiohttp.FormData()
-        form.add_field("model", self.model)
-        form.add_field("prompt", prompt or "edit this image")
-        if self.size:
-            form.add_field("size", self.size)
-        for i, img in enumerate(input_images):
-            form.add_field(
-                "image[]" if len(input_images) > 1 else "image",
-                img,
-                filename=f"image_{i}.png",
-                content_type="image/png",
-            )
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        return await self._post_json(session, url, data=form, headers=headers)
+        last_err = None
+        for body in candidates:
+            try:
+                payload = await self._post_json(session, url, json=body, headers=self.headers)
+            except Exception as e:
+                # 非 JSON 响应（可能要 multipart）—— 停止 JSON 尝试，去回退
+                last_err = e
+                break
+            # 拿到 JSON 了。如果是 image 字段相关的报错，换下一种格式重试
+            err_msg = self._extract_error_msg(payload)
+            if err_msg and ("image" in err_msg.lower() and "required" in err_msg.lower()):
+                last_err = RuntimeError(err_msg)
+                continue
+            return payload  # 成功，或其它业务错误（交给 parse 报具体错）
+
+        # —— 回退：multipart（标准 OpenAI 风格）——
+        try:
+            form = aiohttp.FormData()
+            form.add_field("model", self.model)
+            form.add_field("prompt", p)
+            if self.size:
+                form.add_field("size", self.size)
+            for i, img in enumerate(input_images):
+                form.add_field(
+                    "image[]" if len(input_images) > 1 else "image",
+                    img,
+                    filename=f"image_{i}.png",
+                    content_type="image/png",
+                )
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            return await self._post_json(session, url, data=form, headers=headers)
+        except Exception as e:
+            raise last_err or e
+
+    def _extract_error_msg(self, payload):
+        if isinstance(payload, dict) and payload.get("error"):
+            err = payload["error"]
+            return err.get("message") if isinstance(err, dict) else str(err)
+        return None
 
 
     async def _parse_images_payload(self, payload: dict):
