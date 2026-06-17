@@ -261,20 +261,28 @@ class DrawPlugin(Star):
     async def _edit_multipart(self, session, prompt, input_images, errors):
         url = f"{self.base_url}/images/edits"
         p = prompt or "edit this image"
-        single = len(input_images) == 1
+        
         form = aiohttp.FormData()
-        form.add_field("model", self.edit_model)
-        form.add_field("prompt", p)
-        form.add_field("n", "1")
-        if self.size:
-            form.add_field("size", self.size)
+        # 1. 优先放入图片，很多服务器对顺序敏感
         for i, img in enumerate(input_images):
             form.add_field(
-                "image[]" if not single else "image",
+                "image",  # 使用标准 OpenAI 字段名 'image'
                 img,
                 filename=f"image_{i}.png",
                 content_type="image/png",
             )
+            
+        # 2. 其他参数
+        form.add_field("prompt", p)
+        form.add_field("n", "1")
+        if self.size:
+            form.add_field("size", self.size)
+        
+        # 部分中转不支持在 multipart 中传 model，或需要特定名称。
+        # 尝试先不传 model，如果报错再考虑。
+        # 但为了兼容性，我们先尝试传，如果失败可以用 _edit_json 兜底。
+        form.add_field("model", self.edit_model)
+        
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             payload = await self._post_json(session, url, data=form, headers=headers)
